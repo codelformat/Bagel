@@ -706,14 +706,12 @@ def main():
         data = data.cuda(device).to_dict()
         data_indexes = data.pop('batch_data_indexes', None)
         ce_loss_weights = data.pop('ce_loss_weights', None)       
-        tokens_tensor = torch.tensor(float(data['sequence_length']), device=device)
-        dist.all_reduce(tokens_tensor, op=dist.ReduceOp.SUM)
-        token_window += tokens_tensor.item()
+        # MFU stats: accumulate this rank's values in Python (they already live on the CPU),
+        # all-reduce once at log time. Removes 2 blocking H2D copies + 2 .item() per step
+        # (each .item() after an all_reduce also waits for the slowest rank).
+        token_window += float(data['sequence_length'])
         if data['sample_lens']:
-            sample_lens_tensor = torch.tensor(data['sample_lens'], dtype=torch.float32, device=device)
-            sample_square = torch.dot(sample_lens_tensor, sample_lens_tensor)
-            dist.all_reduce(sample_square, op=dist.ReduceOp.SUM)
-            seqlen_square_window += sample_square.item()
+            seqlen_square_window += float(sum(l * l for l in data['sample_lens']))
 
         _rf_forward = torch.profiler.record_function("BAGEL_forward"); _rf_forward.__enter__()  # BAGEL_PROFILER_PATCH
         with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
@@ -732,7 +730,7 @@ def main():
         loss = 0
         ce = loss_dict["ce"]
         if ce is not None:
-            total_ce_tokens = torch.tensor(len(data['ce_loss_indexes']), device=device)
+            total_ce_tokens = torch.full((), len(data['ce_loss_indexes']), device=device) # Directly create tensor on GPU
             dist.all_reduce(total_ce_tokens, op=dist.ReduceOp.SUM)
             if training_args.ce_loss_reweighting:
                 ce = ce * ce_loss_weights
@@ -750,7 +748,7 @@ def main():
 
         if training_args.visual_gen:
             mse = loss_dict["mse"]
-            total_mse_tokens = torch.tensor(len(data['mse_loss_indexes']), device=device)
+            total_mse_tokens = torch.full((), len(data['mse_loss_indexes']), device=device) # Directly create tensor on GPU
             dist.all_reduce(total_mse_tokens, op=dist.ReduceOp.SUM)
             mse = mse.mean(dim=-1).sum() * dist.get_world_size() / total_mse_tokens
             loss_dict["mse"] = mse.detach()
@@ -784,6 +782,11 @@ def main():
             end_time = time()
             elapsed = max(end_time - start_time, 1e-6)
             steps_per_sec = training_args.log_every / elapsed
+            # Compute total tokens and total sequence length squared across all ranks
+            win = torch.tensor([token_window, seqlen_square_window], device=device, dtype=torch.float64)
+            dist.all_reduce(win)
+            token_window, seqlen_square_window = win.tolist()
+
             tokens_per_sec = token_window / elapsed
             tokens_per_step = token_window / training_args.log_every
             flops_all_token = dense_token_factor * token_window + attn_factor * seqlen_square_window
