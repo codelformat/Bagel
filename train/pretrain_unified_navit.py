@@ -663,6 +663,37 @@ def main():
     token_window = 0.0
     seqlen_square_window = 0.0
     dense_token_factor, attn_factor = qwen2_flop_coefficients(model.language_model.config)
+    # ===== BAGEL_PROFILER_PATCH: torch profiler setup =====
+    prof = None
+    if os.environ.get("PROFILE", "0") == "1":
+        from torch.profiler import profile, schedule, ProfilerActivity
+        _rank = dist.get_rank()
+        _ranks = os.environ.get("PROFILE_RANKS", "0")
+        if _ranks == "all" or str(_rank) in _ranks.split(","):
+            _prof_dir = os.environ.get("PROFILE_DIR", os.path.join(training_args.results_dir, "profile"))
+            os.makedirs(_prof_dir, exist_ok=True)
+
+            def _trace_handler(p):
+                out = os.path.join(_prof_dir, f"rank{_rank}_step{p.step_num}.pt.trace.json.gz")
+                p.export_chrome_trace(out)
+                print(f"[profiler] rank {_rank} trace saved to {out}", flush=True)
+                print(p.key_averages().table(sort_by="cuda_time_total", row_limit=25), flush=True)
+
+            prof = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=schedule(
+                    wait=int(os.environ.get("PROFILE_WAIT", 5)),
+                    warmup=int(os.environ.get("PROFILE_WARMUP", 2)),
+                    active=int(os.environ.get("PROFILE_ACTIVE", 3)),
+                    repeat=1,
+                ),
+                on_trace_ready=_trace_handler,
+                record_shapes=True,
+                profile_memory=os.environ.get("PROFILE_MEMORY", "0") == "1",
+                with_stack=os.environ.get("PROFILE_STACK", "0") == "1",
+            )
+            prof.start()
+    # ===== end profiler setup =====
     for micro_step, data in enumerate(train_loader):
         curr_step = train_step + micro_step // training_args.gradient_accumulation_steps
         if curr_step >= training_args.total_steps:
@@ -680,6 +711,7 @@ def main():
             dist.all_reduce(sample_square, op=dist.ReduceOp.SUM)
             seqlen_square_window += sample_square.item()
 
+        _rf_forward = torch.profiler.record_function("BAGEL_forward"); _rf_forward.__enter__()  # BAGEL_PROFILER_PATCH
         with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
             if training_args.visual_gen:
                 with torch.no_grad():
@@ -692,6 +724,7 @@ def main():
                     torch.cuda.empty_cache()
                 raise e
         
+        _rf_forward.__exit__(None, None, None)  # BAGEL_PROFILER_PATCH
         loss = 0
         ce = loss_dict["ce"]
         if ce is not None:
@@ -724,14 +757,18 @@ def main():
             total_mse_tokens = torch.tensor(0, device=device)
 
         loss = loss / training_args.gradient_accumulation_steps
+        _rf_backward = torch.profiler.record_function("BAGEL_backward"); _rf_backward.__enter__()  # BAGEL_PROFILER_PATCH
         loss.backward()
+        _rf_backward.__exit__(None, None, None)  # BAGEL_PROFILER_PATCH
 
         if (micro_step + 1) % training_args.gradient_accumulation_steps == 0:
+            _rf_optimizer = torch.profiler.record_function("BAGEL_optimizer"); _rf_optimizer.__enter__()  # BAGEL_PROFILER_PATCH
             total_norm = fsdp_model.clip_grad_norm_(training_args.max_grad_norm)
             optimizer.step()
             scheduler.step()
             fsdp_ema_update(ema_model, fsdp_model, decay=training_args.ema)
             optimizer.zero_grad()
+            _rf_optimizer.__exit__(None, None, None)  # BAGEL_PROFILER_PATCH
         
         # Log loss values:
         if curr_step % training_args.log_every == 0:
@@ -793,6 +830,9 @@ def main():
                 data_status[item['dataset_name']] = {}
             data_status[item['dataset_name']][item['worker_id']] = item['data_indexes']
 
+        if prof is not None:  # BAGEL_PROFILER_PATCH
+            prof.step()
+
         if curr_step > 0 and curr_step % training_args.save_every == 0:
             # Clear caches and ensure all CUDA operations complete before checkpoint
             torch.cuda.empty_cache()
@@ -833,8 +873,11 @@ def main():
             #     os.path.join(training_args.checkpoint_dir, f"{curr_step:07d}", "ema_standard.pt")
             # )
     
+    if prof is not None:  # BAGEL_PROFILER_PATCH
+        prof.stop()
+
     # Save final checkpoint if not already saved
-    if curr_step > 0:
+    if curr_step > 0 and os.environ.get("SKIP_FINAL_SAVE", "0") != "1":
         logger.info(f"Saving final checkpoint at step {curr_step}...")
         # Clear caches and ensure all CUDA operations complete before final checkpoint
         torch.cuda.empty_cache()
