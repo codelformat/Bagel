@@ -694,6 +694,10 @@ def main():
             )
             prof.start()
     # ===== end profiler setup =====
+    if os.environ.get("SYNC_DEBUG", "0") == "1":
+        # Warn on every implicit CPU-GPU sync (.item(), nonzero, blocking copies, ...),
+        # pointing at the Python line that triggered it.
+        torch.cuda.set_sync_debug_mode("warn")
     for micro_step, data in enumerate(train_loader):
         curr_step = train_step + micro_step // training_args.gradient_accumulation_steps
         if curr_step >= training_args.total_steps:
