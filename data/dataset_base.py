@@ -221,6 +221,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
             data['packed_vit_position_ids'] = torch.cat(sequence_status['packed_vit_position_ids'], dim=0)
             data['packed_vit_token_indexes'] = torch.tensor(sequence_status['packed_vit_token_indexes'])
             data['vit_token_seqlens'] = torch.tensor(sequence_status['vit_token_seqlens'])
+            data['vit_max_seqlen'] = max(sequence_status['vit_token_seqlens'])
 
         # if the model is required to perform visual generation
         if len(sequence_status['packed_timesteps']) > 0:
@@ -504,6 +505,7 @@ class SimpleCustomBatch:
             self.packed_vit_position_ids = data["packed_vit_position_ids"]
             self.packed_vit_token_indexes = data["packed_vit_token_indexes"]
             self.vit_token_seqlens = data["vit_token_seqlens"]
+            self.vit_max_seqlen = data["vit_max_seqlen"]
 
         if "packed_timesteps" in data.keys():
             self.packed_timesteps = data["packed_timesteps"]
@@ -601,6 +603,7 @@ class SimpleCustomBatch:
             data['packed_vit_position_ids'] = self.packed_vit_position_ids
             data['packed_vit_token_indexes'] = self.packed_vit_token_indexes
             data['vit_token_seqlens'] = self.vit_token_seqlens
+            data['vit_max_seqlen'] = self.vit_max_seqlen
 
         if hasattr(self, 'packed_timesteps'):
             data['packed_timesteps'] = self.packed_timesteps

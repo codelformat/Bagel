@@ -115,6 +115,7 @@ class Bagel(PreTrainedModel):
         packed_vit_token_indexes: Optional[torch.LongTensor] = None,
         packed_vit_position_ids: Optional[torch.LongTensor] = None,
         vit_token_seqlens: Optional[torch.IntTensor] = None,
+        vit_max_seqlen: Optional[int] = None,
         # for visual generation
         padded_latent: Optional[torch.Tensor] = None,
         patchified_vae_latent_shapes: Optional[List[Tuple[int, int]]] = None,
@@ -138,6 +139,7 @@ class Bagel(PreTrainedModel):
             packed_vit_position_ids: 1-D int tensor, the position of each token for vit model.
             packed_vit_token_indexes: 1-D int tensor, packed vit token indexes in sequence.
             vit_token_seqlens: 1-D int tensor, the length of each image tokens for vit model.
+            vit_max_seqlen: int, the maximum sequence length of vision tokens.
             packed_label_ids: 1-D int tensor, packed label token ids.
             ce_loss_indexes: 1-D bool tensor, where to compute ce loss.
 
@@ -166,7 +168,7 @@ class Bagel(PreTrainedModel):
         if self.config.visual_und:
             cu_seqlens = torch.nn.functional.pad(torch.cumsum(vit_token_seqlens, dim=0), (1, 0))
             cu_seqlens = cu_seqlens.to(torch.int32)
-            max_seqlen = torch.max(vit_token_seqlens).item()
+            max_seqlen = vit_max_seqlen if vit_max_seqlen is not None else torch.max(vit_token_seqlens).item()
             packed_vit_token_embed = self.vit_model(
                 packed_pixel_values=packed_vit_tokens, 
                 packed_flattened_position_ids=packed_vit_position_ids,
