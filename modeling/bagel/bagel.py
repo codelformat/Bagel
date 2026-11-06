@@ -218,10 +218,13 @@ class Bagel(PreTrainedModel):
 
         mse = None
         if self.config.visual_gen:
-            packed_mse_preds = self.llm2vae(last_hidden_state[mse_loss_indexes])
-            target = noise - packed_latent_clean # NOTE: v_t=dx_t/dt=x_1-x_0, pointing from data to noise
-            has_mse = packed_timesteps > 0
-            mse = (packed_mse_preds - target[has_mse]) ** 2
+            packed_mse_preds = self.llm2vae(last_hidden_state[packed_vae_token_indexes])
+            # Fixed-shape masking instead of target[has_mse]: bool-mask indexing runs nonzero(),
+            # i.e. a D2H copy + stream sync. Rows of clean (condition) images get weight 0; the
+            # trainer sums rows and divides by len(mse_loss_indexes), so the loss is unchanged.
+            target = noise - packed_latent_clean  # NOTE: v_t=dx_t/dt=x_1-x_0, pointing from data to noise
+            has_mse = (packed_timesteps > 0).to(target.dtype)[:, None]
+            mse = (packed_mse_preds - target) ** 2 * has_mse
 
         ce = None
         if ce_loss_indexes is not None:
