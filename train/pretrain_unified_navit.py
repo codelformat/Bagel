@@ -774,18 +774,41 @@ def main():
         
         # Log loss values:
         if curr_step % training_args.log_every == 0:
-            total_samples = torch.tensor(len(data['sample_lens']), device=device)
-            dist.all_reduce(total_samples, op=dist.ReduceOp.SUM)
-
-            # Measure training speed:
+            # Measure training speed. This is the only intentional drain of the log step:
+            # wait until the GPU has finished the last log_every steps, so the wall time is real.
             torch.cuda.synchronize()
             end_time = time()
             elapsed = max(end_time - start_time, 1e-6)
             steps_per_sec = training_args.log_every / elapsed
-            # Compute total tokens and total sequence length squared across all ranks
-            win = torch.tensor([token_window, seqlen_square_window], device=device, dtype=torch.float64)
-            dist.all_reduce(win)
-            token_window, seqlen_square_window = win.tolist()
+
+            # Pack every logged number into 1 SUM all_reduce + 1 MAX all_reduce, then bring
+            # them all back with a single .tolist() (the only D2H copy of the log step).
+            ws = dist.get_world_size()
+            loss_keys = list(loss_dict.keys())
+            n_loss = len(loss_keys)
+            # Numbers that live on the CPU -> one small H2D copy (the queue was just drained, ~free).
+            host_vals = torch.tensor(
+                [token_window, seqlen_square_window, len(data['sample_lens']),
+                 torch.cuda.max_memory_allocated() / 1024**2, torch.cuda.max_memory_reserved() / 1024**2],
+                dtype=torch.float64, device=device,
+            )
+            # Losses are already GPU tensors: reduce them directly, no .item() -> torch.tensor round trip.
+            sum_vals = torch.cat([torch.stack([loss_dict[k].detach().double() for k in loss_keys]),
+                                  host_vals[:3]])
+            max_vals = host_vals[3:]  # contiguous view of host_vals, all-reduced in place
+            dist.all_reduce(sum_vals, op=dist.ReduceOp.SUM)
+            dist.all_reduce(max_vals, op=dist.ReduceOp.MAX)
+            # Already global (all-reduced inside the training step): only read them back, no reduce.
+            global_vals = torch.stack([total_mse_tokens.double(),
+                                       total_ce_tokens.double(),
+                                       total_norm.double()])
+            vals = torch.cat([sum_vals, max_vals, global_vals]).tolist()
+
+            # Unpack in the same order as packed. From here on everything is a plain Python number.
+            avg_losses = {k: v / ws for k, v in zip(loss_keys, vals[:n_loss])}
+            (token_window, seqlen_square_window, total_samples,
+             mem_allocated, mem_cache,
+             mse_tokens, ce_tokens, grad_norm) = vals[n_loss:]
 
             tokens_per_sec = token_window / elapsed
             tokens_per_step = token_window / training_args.log_every
@@ -795,11 +818,7 @@ def main():
             mfu_value = actual_tflops / peak_total_tflops if peak_total_tflops > 0 else 0.0
             message = f"(step={curr_step:07d}) "
             wandb_log = {}
-            for key, value in loss_dict.items():
-                # Reduce loss history over all processes:
-                avg_loss = torch.tensor(value.item(), device=device)
-                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                avg_loss = avg_loss.item() / dist.get_world_size()
+            for key, avg_loss in avg_losses.items():
                 message += f"Train Loss {key}: {avg_loss:.4f}, "
                 wandb_log[key] = avg_loss
             message += f"Train Steps/Sec: {steps_per_sec:.2f}, Tokens/Sec: {tokens_per_sec/1000:.2f}k, MFU: {mfu_value*100:.1f}%, "
@@ -808,20 +827,16 @@ def main():
                 print(message, flush=True)
 
             wandb_log['lr'] = optimizer.param_groups[0]['lr']
-            wandb_log['total_mse_tokens'] = total_mse_tokens.item()
-            wandb_log['total_ce_tokens'] = total_ce_tokens.item()
-            wandb_log['total_norm'] = total_norm.item()
-            wandb_log['total_samples'] = total_samples.item()
+            wandb_log['total_mse_tokens'] = int(mse_tokens)
+            wandb_log['total_ce_tokens'] = int(ce_tokens)
+            wandb_log['total_norm'] = grad_norm
+            wandb_log['total_samples'] = int(total_samples)
             wandb_log['tokens_per_sec'] = tokens_per_sec
             wandb_log['tokens_per_step'] = tokens_per_step
             wandb_log['actual_tflops'] = actual_tflops
             wandb_log['mfu'] = mfu_value
 
-            mem_allocated = torch.tensor(torch.cuda.max_memory_allocated() / 1024**2, device=device)
-            dist.all_reduce(mem_allocated, op=dist.ReduceOp.MAX)
             wandb_log['mem_allocated'] = mem_allocated
-            mem_cache = torch.tensor(torch.cuda.max_memory_reserved() / 1024**2, device=device)
-            dist.all_reduce(mem_cache, op=dist.ReduceOp.MAX)
             wandb_log['mem_cache'] = mem_cache
 
             if dist.get_rank() == 0:
